@@ -4,26 +4,30 @@ from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+import sys
+import traceback
 
-# Try to import your renderer without assuming a single function name
-# We will try common call shapes used in our earlier steps
+# Try to import renderer and record any error so we can see it from /diagnostics
+renderer = None
+RENDER_IMPORT_ERROR = ""
+
 try:
-    import render_avatar as renderer  # your /app/render_avatar.py
+    import render_avatar as renderer  # /app/render_avatar.py
 except Exception as _e:
-    renderer = None
+    RENDER_IMPORT_ERROR = f"{type(_e).__name__}: {str(_e)}\n{traceback.format_exc()}"
 
-app = FastAPI(title="TLR Avatar Render Service", version="1.0.0")
+app = FastAPI(title="TLR Avatar Render Service", version="1.0.1")
 
-# CORS so the Studio can call this directly from the browser
+# CORS for Studio
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # lock down to your domains when ready
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Request and response models ----------
+# ---------- Models ----------
 
 class Viewport(BaseModel):
     width: int = 800
@@ -32,7 +36,7 @@ class Viewport(BaseModel):
 
 class Measurements(BaseModel):
     units: Literal["cm", "in"] = "cm"
-    height: float = Field(..., description="Total body height")
+    height: float
     shoulder_width: Optional[float] = None
     chest: Optional[float] = None
     waist: Optional[float] = None
@@ -55,58 +59,135 @@ class RenderResponse(BaseModel):
     png: str = ""
     meta: Dict[str, Any] = {}
 
-# ---------- Health ----------
+# ---------- Routes ----------
+
+@app.get("/")
+def root() -> Dict[str, str]:
+    return {"service": "tlr-avatar", "version": "1.0.1"}
 
 @app.get("/health")
 def health() -> Dict[str, bool]:
     return {"ok": True}
 
-# ---------- Core render route ----------
+@app.get("/diagnostics")
+def diagnostics() -> Dict[str, Any]:
+    """See if the renderer was imported and what symbols it exposes."""
+    info = {
+        "has_renderer": renderer is not None,
+        "import_error": RENDER_IMPORT_ERROR,
+        "renderer_attrs": [],
+    }
+    if renderer is not None:
+        info["renderer_attrs"] = sorted([a for a in dir(renderer) if not a.startswith("_")])
+    return info
+
+@app.post("/test/renderer")
+def test_renderer(payload: dict = Body(default=None)) -> JSONResponse:
+    """Call the renderer directly with a tiny payload to see exceptions plainly."""
+    if renderer is None:
+        return JSONResponse({
+            "ok": False,
+            "error": "renderer_not_loaded",
+            "import_error": RENDER_IMPORT_ERROR,
+        })
+    try:
+        sample = {
+            "measurements": {
+                "units": "cm",
+                "height": 190,
+                "shoulder_width": 48,
+                "chest": 110,
+                "waist": 100,
+                "hip": 115,
+                "arm_length": 64,
+                "leg_length": 110,
+                "thigh": 65,
+                "calf": 42,
+                "neck": 46
+            },
+            "pose": "POSE01",
+            "view": "front",
+            "viewport": {"width": 800, "height": 1100, "ortho": True}
+        }
+        if payload and isinstance(payload, dict):
+            sample.update(payload)
+        # Prefer render(), fall back to render_avatar(), then render_avatar_svg()
+        if hasattr(renderer, "render"):
+            out = renderer.render(
+                measurements=sample["measurements"],
+                pose=sample["pose"],
+                view=sample["view"],
+                viewport=sample["viewport"],
+                returns=["svg"]
+            )
+        elif hasattr(renderer, "render_avatar"):
+            out = renderer.render_avatar(sample)
+        elif hasattr(renderer, "render_avatar_svg"):
+            svg = renderer.render_avatar_svg(sample)
+            out = {"svg": svg, "png": ""}
+        else:
+            return JSONResponse({"ok": False, "error": "no_render_functions_found"})
+        return JSONResponse({"ok": True, "out": out})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e), "trace": traceback.format_exc()})
 
 @app.post("/avatar/render", response_model=RenderResponse)
 def avatar_render(payload: RenderRequest = Body(..., embed=False)) -> JSONResponse:
-    """
-    Returns svg and or png with a small meta object.
-    Matches the avatar_engine_contract in your pickup file.
-    """
     try:
         svg_out = ""
         png_out = ""
 
-        # Prefer renderer if available
         if renderer is not None:
-            # Accept multiple possible function signatures for safety
-            # 1) render(measurements=dict, pose=str, view=str, viewport=dict, returns=list[str])
-            if hasattr(renderer, "render"):
-                result = renderer.render(
-                    measurements=payload.measurements.model_dump(),
-                    pose=payload.pose,
-                    view=payload.view,
-                    viewport=payload.viewport.model_dump(),
-                    returns=list(payload.return_),
-                )
-                svg_out = result.get("svg", "") if isinstance(result, dict) else ""
-                png_out = result.get("png", "") if isinstance(result, dict) else ""
-            # 2) render_avatar or render_avatar_svg style
-            elif hasattr(renderer, "render_avatar"):
-                result = renderer.render_avatar(payload.model_dump(by_alias=True))
-                svg_out = result.get("svg", "") if isinstance(result, dict) else ""
-                png_out = result.get("png", "") if isinstance(result, dict) else ""
-            elif hasattr(renderer, "render_avatar_svg"):
-                svg_out = renderer.render_avatar_svg(payload.model_dump(by_alias=True))
-                # png is optional here
-        else:
-            # Safe fallback so the Studio never goes blank
+            try:
+                if hasattr(renderer, "render"):
+                    result = renderer.render(
+                        measurements=payload.measurements.model_dump(),
+                        pose=payload.pose,
+                        view=payload.view,
+                        viewport=payload.viewport.model_dump(),
+                        returns=list(payload.return_),
+                    )
+                    svg_out = result.get("svg", "") if isinstance(result, dict) else ""
+                    png_out = result.get("png", "") if isinstance(result, dict) else ""
+                elif hasattr(renderer, "render_avatar"):
+                    result = renderer.render_avatar(payload.model_dump(by_alias=True))
+                    svg_out = result.get("svg", "") if isinstance(result, dict) else ""
+                    png_out = result.get("png", "") if isinstance(result, dict) else ""
+                elif hasattr(renderer, "render_avatar_svg"):
+                    svg_out = renderer.render_avatar_svg(payload.model_dump(by_alias=True))
+                else:
+                    # No callable renderer found, fall through to fallback
+                    pass
+            except Exception as re:
+                # Renderer threw. Return structured error and no blank UI.
+                return JSONResponse({
+                    "svg": _fallback_svg(payload),
+                    "png": "",
+                    "meta": {
+                        "units": payload.measurements.units,
+                        "pose": payload.pose,
+                        "scale_px_per_cm": 3.0 if payload.measurements.units == "cm" else 3.0 / 2.54,
+                        "status": "error",
+                        "error": f"renderer_exception: {type(re).__name__}: {str(re)}",
+                    },
+                })
+
+        if not svg_out:
+            # Renderer missing or returned empty: provide fallback so Studio shows something
             svg_out = _fallback_svg(payload)
 
         meta = {
             "units": payload.measurements.units,
             "pose": payload.pose,
             "scale_px_per_cm": 3.0 if payload.measurements.units == "cm" else 3.0 / 2.54,
-            "status": "ok",
+            "status": "ok" if svg_out else "error",
         }
+        if renderer is None:
+            meta["warning"] = "renderer_not_loaded"
+            if RENDER_IMPORT_ERROR:
+                meta["import_error"] = RENDER_IMPORT_ERROR
 
-        # Respect the requested return set
+        # Respect requested returns
         if "svg" not in payload.return_:
             svg_out = ""
         if "png" not in payload.return_:
@@ -115,36 +196,23 @@ def avatar_render(payload: RenderRequest = Body(..., embed=False)) -> JSONRespon
         return JSONResponse({"svg": svg_out, "png": png_out, "meta": meta})
 
     except Exception as e:
-        # Never crash. Return structured error the Studio can handle
-        return JSONResponse(
-            {
-                "svg": "",
-                "png": "",
-                "meta": {
-                    "error": str(e),
-                    "status": "error",
-                },
-            }
-        )
+        return JSONResponse({
+            "svg": "",
+            "png": "",
+            "meta": {"status": "error", "error": str(e)}
+        })
 
-# ---------- Root ----------
-
-@app.get("/")
-def root() -> Dict[str, str]:
-    return {"service": "tlr-avatar", "version": "1.0.0"}
-
-
-# ---------- Simple fallback renderer so Outline mode always has something ----------
+# ---------- Fallback art ----------
 
 def _fallback_svg(req: RenderRequest) -> str:
     vp = req.viewport
     w = vp.width
     h = vp.height
-    # A minimal croquis oval and a guide line so the UI shows Outline view on day one
+    cx = w / 2.0
     return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">
   <rect width="100%" height="100%" fill="white"/>
-  <g stroke="black" fill="none" stroke-width="2">
-    <ellipse cx="{w/2:.1f}" cy="{h*0.12:.1f}" rx="{w*0.07:.1f}" ry="{h*0.06:.1f}"/>
-    <line x1="{w/2:.1f}" y1="{h*0.12 + h*0.06:.1f}" x2="{w/2:.1f}" y2="{h*0.85:.1f}"/>
+  <g stroke="#0B2B4A" fill="none" stroke-width="2">
+    <ellipse cx="{cx:.1f}" cy="{h*0.12:.1f}" rx="{w*0.07:.1f}" ry="{h*0.06:.1f}"/>
+    <line x1="{cx:.1f}" y1="{h*0.18:.1f}" x2="{cx:.1f}" y2="{h*0.85:.1f}"/>
   </g>
 </svg>"""
