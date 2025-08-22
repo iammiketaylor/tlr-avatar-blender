@@ -19,14 +19,13 @@ def ok():
     return {"ok": True}
 
 
-# Render health check — matches your Settings -> Health Check Path
+# Render health check — matches Settings -> Health Check Path
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("ok")
 
 
 def _find_blender() -> str:
-    # Try PATH first, then a few common install paths in our container
     candidates = [
         shutil.which("blender"),
         "/usr/bin/blender",
