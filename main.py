@@ -1,4 +1,4 @@
-# main.py  blender_cycles_1  headless Cycles CPU PNG with clear lighting and camera
+# main.py  blender_cycles_2  headless Cycles PNG that is not black
 
 from typing import List, Optional, Literal, Dict, Any
 from fastapi import FastAPI, Body
@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, Field
 import base64, json, os, subprocess, tempfile, textwrap, shutil
 
-app = FastAPI(title="TLR Avatar Render Service", version="blender_cycles_1")
+app = FastAPI(title="TLR Avatar Render Service", version="blender_cycles_2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,7 +41,7 @@ class RenderRequest(BaseModel):
     view: Literal["front", "back", "side"] = "front"
     return_: List[Literal["svg", "png"]] = Field(default_factory=lambda: ["svg"], alias="return")
     viewport: Viewport = Viewport()
-    engine: Optional[Literal["svg","blender"]] = None  # set to blender to force PNG
+    engine: Optional[Literal["svg","blender"]] = None
 
 class RenderResponse(BaseModel):
     svg: str = ""
@@ -63,8 +63,8 @@ def blender_available() -> bool: return BLENDER_BIN is not None
 
 def run_blender_job(meas: Dict[str, Any], view: str, vp: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Headless Blender with Cycles CPU. Builds a simple mannequin and renders a PNG.
-    Returns { ok, png, rc, stdout, stderr } with errors surfaced.
+    Headless Blender with Cycles CPU. Bright world. Sun light. Grey material on meshes.
+    Orthographic camera in front that tracks a target. Writes a PNG and returns it as data URL.
     """
     if not blender_available():
         return {"ok": False, "png": "", "rc": -1, "stdout": "", "stderr": "blender_not_found"}
@@ -79,14 +79,43 @@ def run_blender_job(meas: Dict[str, Any], view: str, vp: Dict[str, Any]) -> Dict
                 try: bpy.data.objects.remove(o, do_unlink=True)
                 except: pass
 
-        def add_mannequin():
-            bpy.ops.mesh.primitive_uv_sphere_add(radius=0.12, location=(0, 0, 1.80))  # head
+        def make_material():
+            m = bpy.data.materials.new("BodyMat")
+            m.use_nodes = True
+            nt = m.node_tree
+            bsdf = nt.nodes.get("Principled BSDF")
+            bsdf.inputs["Base Color"].default_value = (0.7, 0.7, 0.72, 1.0)  # light grey
+            bsdf.inputs["Roughness"].default_value = 0.6
+            return m
+
+        def add_mannequin(mat):
+            def assign(obj):
+                if obj.data and hasattr(obj.data, "materials"):
+                    if len(obj.data.materials) == 0:
+                        obj.data.materials.append(mat)
+                    else:
+                        obj.data.materials[0] = mat
+
+            bpy.ops.mesh.primitive_uv_sphere_add(radius=0.12, location=(0, 0, 1.80))
+            assign(bpy.context.active_object)
+
             bpy.ops.mesh.primitive_cylinder_add(radius=0.20, depth=0.60, location=(0, 0, 1.40))  # upper torso
+            assign(bpy.context.active_object)
+
             bpy.ops.mesh.primitive_cylinder_add(radius=0.22, depth=0.40, location=(0, 0, 1.00))  # lower torso
+            assign(bpy.context.active_object)
+
             bpy.ops.mesh.primitive_cylinder_add(radius=0.10, depth=0.70, location=(-0.25, 0, 1.25))  # arm L
+            assign(bpy.context.active_object)
+
             bpy.ops.mesh.primitive_cylinder_add(radius=0.10, depth=0.70, location=( 0.25, 0, 1.25))  # arm R
+            assign(bpy.context.active_object)
+
             bpy.ops.mesh.primitive_cylinder_add(radius=0.12, depth=1.00, location=(-0.12, 0, 0.40))  # leg L
+            assign(bpy.context.active_object)
+
             bpy.ops.mesh.primitive_cylinder_add(radius=0.12, depth=1.00, location=( 0.12, 0, 0.40))  # leg R
+            assign(bpy.context.active_object)
 
         def bounds_height():
             deps = bpy.context.evaluated_depsgraph_get()
@@ -108,59 +137,69 @@ def run_blender_job(meas: Dict[str, Any], view: str, vp: Dict[str, Any]) -> Dict
                 if o.type in {"MESH","ARMATURE","EMPTY"}: o.scale *= s
 
         def setup_world_and_light():
-            # bright world so it never renders black
             if bpy.context.scene.world is None:
                 bpy.context.scene.world = bpy.data.worlds.new("World")
-            w = bpy.context.scene.world; w.use_nodes = True
+            w = bpy.context.scene.world
+            w.use_nodes = True
             bg = w.node_tree.nodes.get("Background")
             if bg:
-                bg.inputs[0].default_value = (1,1,1,1)  # white
-                bg.inputs[1].default_value = 1.0
-            # sun light
+                bg.inputs[0].default_value = (1.0, 1.0, 1.0, 1.0)   # white background
+                bg.inputs[1].default_value = 5.0                   # bright so it lights the scene
+
             sun = bpy.data.lights.new("sun","SUN")
-            sun.energy = 3.0
+            sun.energy = 5.0
             so = bpy.data.objects.new("sun",sun)
             bpy.context.scene.collection.objects.link(so)
-            so.location = (2.0, 2.0, 3.0)
+            so.location = (3.0, 2.0, 4.0)
             so.rotation_euler = (math.radians(50), 0, math.radians(-20))
 
-        def add_camera_front_ortho(scale=2.6):
-            cam = bpy.data.cameras.new("cam"); cam.type='ORTHO'; cam.ortho_scale = scale
+        def add_camera_front_ortho(scale=2.8):
+            cam = bpy.data.cameras.new("cam")
+            cam.type='ORTHO'
+            cam.ortho_scale = scale
+            cam.clip_start = 0.01
+            cam.clip_end = 100.0
             co = bpy.data.objects.new("cam", cam)
             bpy.context.scene.collection.objects.link(co)
-            co.location = (0.0, -4.0, 1.2)  # in front of origin
+            co.location = (0.0, -5.0, 1.2)
             tgt = bpy.data.objects.new("target", None)
-            bpy.context.scene.collection.objects.link(tgt); tgt.location = (0.0, 0.0, 1.0)
-            con = co.constraints.new(type='TRACK_TO'); con.target = tgt
-            con.track_axis='TRACK_NEGATIVE_Z'; con.up_axis='UP_Y'
+            bpy.context.scene.collection.objects.link(tgt)
+            tgt.location = (0.0, 0.0, 1.0)
+            con = co.constraints.new(type='TRACK_TO')
+            con.target = tgt
+            con.track_axis='TRACK_NEGATIVE_Z'
+            con.up_axis='UP_Y'
             bpy.context.scene.camera = co
 
         def setup_cycles(W,H):
             sc = bpy.context.scene
             sc.render.engine = 'CYCLES'
             sc.cycles.device = 'CPU'
-            sc.cycles.samples = 8
+            sc.cycles.samples = 16
             sc.cycles.use_adaptive_sampling = True
-            sc.render.resolution_x = int(W); sc.render.resolution_y = int(H)
+            sc.view_settings.view_transform = 'Standard'  # avoid Filmic lookup errors
+            sc.render.resolution_x = int(W)
+            sc.render.resolution_y = int(H)
             sc.render.film_transparent = False
+            sc.render.image_settings.file_format = 'PNG'
 
-        # parse args
+        # args
         args = sys.argv[sys.argv.index("--")+1:]
         cfg_path, out_png = args[0], args[1]
-        import json
         with open(cfg_path,"r") as f: cfg = json.load(f)
         W = cfg.get("W",800); H = cfg.get("H",1100)
         target_h_m = float(cfg.get("height_cm",180))/100.0
 
         clear_scene()
-        add_mannequin()
+        mat = make_material()
+        add_mannequin(mat)
         scale_to_height(target_h_m)
         setup_world_and_light()
-        add_camera_front_ortho(scale=2.6)
+        add_camera_front_ortho(scale=2.8)
         setup_cycles(W,H)
 
-        bpy.context.scene.render.filepath = out_png
         bpy.ops.render.render(write_still=True)
+        bpy.data.images['Render Result'].save_render(out_png)
     """)
 
     with tempfile.TemporaryDirectory() as td:
@@ -174,7 +213,9 @@ def run_blender_job(meas: Dict[str, Any], view: str, vp: Dict[str, Any]) -> Dict
                 [BLENDER_BIN, "-b", "-noaudio", "--python", job_path, "--", cfg_path, out_png],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300, text=True
             )
-            rc = proc.returncode; stdout = proc.stdout[-4000:] if proc.stdout else ""; stderr = proc.stderr[-4000:] if proc.stderr else ""
+            rc = proc.returncode
+            stdout = proc.stdout[-4000:] if proc.stdout else ""
+            stderr = proc.stderr[-4000:] if proc.stderr else ""
         except Exception as e:
             return {"ok": False, "png": "", "rc": -2, "stdout": "", "stderr": f"{type(e).__name__}: {e}"}
 
@@ -185,7 +226,7 @@ def run_blender_job(meas: Dict[str, Any], view: str, vp: Dict[str, Any]) -> Dict
         return {"ok": True, "png": "data:image/png;base64,"+b64, "rc": rc, "stdout": stdout, "stderr": stderr}
 
 @app.get("/")
-def root(): return {"service": "tlr-avatar", "version": "blender_cycles_1"}
+def root(): return {"service": "tlr-avatar", "version": "blender_cycles_2"}
 
 @app.get("/health")
 def health(): return {"ok": True}
