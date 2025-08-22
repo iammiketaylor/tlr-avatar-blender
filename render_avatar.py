@@ -1,7 +1,8 @@
-# render_avatar.py  renderer version croquis_0_4
-# Clean nine-head croquis. Fixed head placement, smooth closed torso, rounded limbs.
+# render_avatar.py  renderer version croquis_1_0
+# Nine-head croquis with smoother torso, real shoulder slope, pelvis wedge, and tapered limbs.
+# Widths are slightly amplified so body differences read clearly.
 
-__version__ = "croquis_0_4"
+__version__ = "croquis_1_0"
 
 from typing import Dict, Any, List
 
@@ -41,9 +42,7 @@ def render_avatar_svg(req: Dict[str, Any]) -> str:
     y_knee  = 6.50 * Hu
     y_ankle = 8.80 * Hu
     y_shldr = y_chest - 0.25 * Hu
-    # Keep neck just under the head, not inside it
     y_neck  = y_chin + 0.05 * Hu
-
     cx = w / 2.0
 
     # Measurements with fallbacks
@@ -55,15 +54,19 @@ def render_avatar_svg(req: Dict[str, Any]) -> str:
     calf           = _val(m, "calf",  max(thigh * 0.65, 38.0))
     upper_arm_w_cm = max(chest / 12.0, 9.0)
 
+    # Amplify widths so differences read clearly
+    amp_upper = 1.18
+    amp_lower = 1.20
+
     # Convert to half-widths in px
-    shoulderW = (shoulder_width / 2.0) * px_per_cm
-    chestW    = (chest / 4.0) * px_per_cm
-    waistW    = (waist / 4.0) * px_per_cm
-    hipW      = (hip / 4.0) * px_per_cm
-    upperArmW = upper_arm_w_cm * px_per_cm
-    foreArmW  = upperArmW * 0.8
-    thighW    = (thigh / 6.0) * px_per_cm
-    calfW     = thighW * 0.65
+    shoulderW = (shoulder_width / 2.0) * px_per_cm * amp_upper
+    chestW    = (chest         / 4.0) * px_per_cm * amp_upper
+    waistW    = (waist         / 4.2) * px_per_cm * amp_upper
+    hipW      = (hip           / 4.0) * px_per_cm * amp_lower
+    upperArmW = upper_arm_w_cm * px_per_cm * 0.95
+    foreArmW  = upperArmW * 0.82
+    thighW    = (thigh         / 5.5) * px_per_cm * amp_lower
+    calfW     = thighW * 0.62
 
     # Guardrails
     maxW = w * 0.42
@@ -73,116 +76,108 @@ def render_avatar_svg(req: Dict[str, Any]) -> str:
     hipW      = min(hipW,      maxW)
     upperArmW = min(upperArmW, maxW * 0.6)
     foreArmW  = min(foreArmW,  maxW * 0.6)
-    thighW    = min(thighW,    maxW * 0.7)
-    calfW     = min(calfW,     maxW * 0.6)
+    thighW    = min(thighW,    maxW * 0.70)
+    calfW     = min(calfW,     maxW * 0.60)
 
-    neckW = min(shoulderW * 0.22, 22.0)
+    neckW = min(shoulderW * 0.24, 24.0)
 
-    # Head ellipse where the bottom touches the chin line
+    # Head ellipse sits on the chin line
     head_ry = 0.45 * Hu
-    head_cy = y_chin - head_ry   # bottom = y_chin
+    head_cy = y_chin - head_ry
     head_rx = w * 0.07
 
     # Key x positions
     xL = {"hip": cx - hipW, "waist": cx - waistW, "chest": cx - chestW, "shoulder": cx - shoulderW, "neck": cx - neckW}
     xR = {"hip": cx + hipW, "waist": cx + waistW, "chest": cx + chestW, "shoulder": cx + shoulderW, "neck": cx + neckW}
 
-    # Torso as one smooth closed outline using cubic curves
+    # Pelvis wedge at hip line for a believable join into legs
+    pelvis_half = max(hipW * 0.22, 18.0)
+    crotch_gap  = max(hipW * 0.18, 16.0)
+    left_pelvis_x  = cx - pelvis_half
+    right_pelvis_x = cx + pelvis_half
+    y_crotch = y_hip + 0.08 * Hu
+
+    # Torso outline, one closed path, smooth curves
     t = []
-    # start at bottom center, go to left hip
-    t.append(("M", cx, y_hip + 0.10 * Hu))
-    t.append(("L", xL["hip"], y_hip + 0.10 * Hu))
-    # left hip -> waist
+    t.append(("M", cx, y_crotch))
+    t.append(("L", xL["hip"], y_hip + 0.06 * Hu))
     t.append(("C",
         xL["hip"], y_hip - 0.18 * Hu,
         xL["waist"] - 0.10 * hipW, y_waist + 0.10 * Hu,
         xL["waist"], y_waist
     ))
-    # waist -> chest
     t.append(("C",
         xL["waist"] - 0.10 * waistW, y_waist - 0.12 * Hu,
         xL["chest"] - 0.08 * chestW, y_chest + 0.02 * Hu,
         xL["chest"], y_chest
     ))
-    # chest -> shoulder
     t.append(("C",
-        xL["chest"] - 0.05 * chestW, y_chest - 0.12 * Hu,
-        xL["shoulder"] - 0.10 * shoulderW, y_shldr + 0.02 * Hu,
+        xL["chest"] - 0.06 * chestW, y_chest - 0.13 * Hu,
+        xL["shoulder"] - 0.12 * shoulderW, y_shldr + 0.02 * Hu,
         xL["shoulder"], y_shldr
     ))
-    # shoulder -> neck
     t.append(("C",
         xL["shoulder"] + 0.35 * neckW, y_shldr,
         xL["neck"] + 0.10 * neckW, y_neck + 0.02 * Hu,
         xL["neck"], y_neck
     ))
-    # cross neck
     t.append(("L", xR["neck"], y_neck))
-    # neck -> shoulder (right)
     t.append(("C",
         xR["neck"] - 0.10 * neckW, y_neck + 0.02 * Hu,
         xR["shoulder"] - 0.35 * neckW, y_shldr,
         xR["shoulder"], y_shldr
     ))
-    # shoulder -> chest
     t.append(("C",
-        xR["shoulder"] + 0.10 * shoulderW, y_shldr + 0.02 * Hu,
-        xR["chest"] + 0.05 * chestW, y_chest - 0.12 * Hu,
+        xR["shoulder"] + 0.12 * shoulderW, y_shldr + 0.02 * Hu,
+        xR["chest"] + 0.06 * chestW, y_chest - 0.13 * Hu,
         xR["chest"], y_chest
     ))
-    # chest -> waist
     t.append(("C",
         xR["chest"] + 0.08 * chestW, y_chest + 0.02 * Hu,
         xR["waist"] + 0.10 * waistW, y_waist - 0.12 * Hu,
         xR["waist"], y_waist
     ))
-    # waist -> hip
     t.append(("C",
         xR["waist"] + 0.10 * hipW, y_waist + 0.10 * Hu,
         xR["hip"], y_hip - 0.18 * Hu,
-        xR["hip"], y_hip + 0.10 * Hu
+        xR["hip"], y_hip + 0.06 * Hu
     ))
-    # back to bottom center
-    t.append(("L", cx, y_hip + 0.10 * Hu))
+    t.append(("L", cx, y_crotch))
     torso_d = _path(t) + " Z"
 
     # Arms as tapered capsules with rounded ends
     y_elbow = 0.5 * (y_chest + y_waist)
-    y_wrist = y_hip - 0.20 * Hu
+    y_wrist = y_hip - 0.22 * Hu
     armL = _capsule_tapered(
         x1=xL["shoulder"], y1=y_shldr,
-        x2=xL["shoulder"] - upperArmW * 0.35, y2=y_elbow,
-        r1=max(upperArmW * 0.35, 6.0), r2=max(foreArmW * 0.30, 5.0),
+        x2=xL["shoulder"] - upperArmW * 0.36, y2=y_elbow,
+        r1=max(upperArmW * 0.36, 6.0), r2=max(foreArmW * 0.30, 5.0),
         end_y=y_wrist
     )
     armR = _capsule_tapered(
         x1=xR["shoulder"], y1=y_shldr,
-        x2=xR["shoulder"] + upperArmW * 0.35, y2=y_elbow,
-        r1=max(upperArmW * 0.35, 6.0), r2=max(foreArmW * 0.30, 5.0),
+        x2=xR["shoulder"] + upperArmW * 0.36, y2=y_elbow,
+        r1=max(upperArmW * 0.36, 6.0), r2=max(foreArmW * 0.30, 5.0),
         end_y=y_wrist
     )
 
-    # Legs as tapered capsules
-    hip_gap = max(hipW * 0.20, 16.0)
-    left_hip_x  = cx - hip_gap
-    right_hip_x = cx + hip_gap
+    # Legs as tapered capsules from pelvis wedge
     legL = _capsule_tapered(
-        x1=left_hip_x, y1=y_hip + 0.05 * Hu,
-        x2=left_hip_x - thighW * 0.25, y2=y_knee,
-        r1=max(thighW * 0.55, 7.0), r2=max(calfW * 0.50, 6.0),
+        x1=left_pelvis_x, y1=y_crotch,
+        x2=left_pelvis_x - thighW * 0.28, y2=y_knee,
+        r1=max(thighW * 0.56, 7.0), r2=max(calfW * 0.50, 6.0),
         end_y=y_ankle
     )
     legR = _capsule_tapered(
-        x1=right_hip_x, y1=y_hip + 0.05 * Hu,
-        x2=right_hip_x + thighW * 0.25, y2=y_knee,
-        r1=max(thighW * 0.55, 7.0), r2=max(calfW * 0.50, 6.0),
+        x1=right_pelvis_x, y1=y_crotch,
+        x2=right_pelvis_x + thighW * 0.28, y2=y_knee,
+        r1=max(thighW * 0.56, 7.0), r2=max(calfW * 0.50, 6.0),
         end_y=y_ankle
     )
 
     # Internal grid
     grid = _grid_lines(w, h, Hu)
 
-    # One stroke style for clean joins
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">
   <rect width="100%" height="100%" fill="white"/>
   <g opacity="0.10" stroke="#0B2B4A" stroke-width="1">{grid}</g>
@@ -225,7 +220,6 @@ def _capsule_tapered(
     y_far = end_y if end_y is not None else y2
     cx = (x1 + x2) / 2.0
     cy = (y1 + y_far) / 2.0
-    # Rounded tip at far end
     return _path([
         ("M", x1 - r1 * 0.45, y1),
         ("C", cx - r1, cy, cx - r2, cy, x2 - r2 * 0.45, y_far),
