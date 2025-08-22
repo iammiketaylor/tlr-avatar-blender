@@ -1,4 +1,4 @@
-# main.py  blender_2  solid CPU render and clear error reporting
+# main.py  blender_3  fixed Blender script and solid PNG path
 
 from typing import List, Optional, Literal, Dict, Any
 from fastapi import FastAPI, Body
@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, Field
 import base64, json, os, subprocess, tempfile, textwrap, shutil
 
-app = FastAPI(title="TLR Avatar Render Service", version="blender_2")
+app = FastAPI(title="TLR Avatar Render Service", version="blender_3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,7 +43,7 @@ class RenderRequest(BaseModel):
     view: Literal["front", "back", "side"] = "front"
     return_: List[Literal["svg", "png"]] = Field(default_factory=lambda: ["svg"], alias="return")
     viewport: Viewport = Viewport()
-    engine: Optional[Literal["svg","blender"]] = None  # set to "blender" to force PNG
+    engine: Optional[Literal["svg","blender"]] = None
 
 class RenderResponse(BaseModel):
     svg: str = ""
@@ -71,70 +71,72 @@ def blender_available() -> bool:
 
 def run_blender_job(meas: Dict[str, Any], view: str, vp: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Runs Blender headless with Cycles CPU and renders a simple mannequin PNG.
-    Returns dict: { ok: bool, png: str|"", rc: int, stdout: str, stderr: str }
+    Run Blender headless and return a PNG as a data URL.
+    Uses a simple mannequin made from primitives and scales to requested height.
+    Returns dict { ok, png, rc, stdout, stderr } with stderr included on failure.
     """
     if not blender_available():
         return {"ok": False, "png": "", "rc": -1, "stdout": "", "stderr": "blender_not_found"}
 
     pycode = textwrap.dedent("""
         import bpy, sys, json, math
+        from mathutils import Vector
 
         def clear_scene():
             bpy.ops.wm.read_homefile(use_empty=True)
-            for obj in list(bpy.data.objects):
-                bpy.data.objects.remove(obj, do_unlink=True)
+            for o in list(bpy.data.objects):
+                try:
+                    bpy.data.objects.remove(o, do_unlink=True)
+                except Exception:
+                    pass
 
         def add_mannequin():
-            # simple parts
-            bpy.ops.mesh.primitive_uv_sphere_add(radius=0.12, location=(0, 0, 1.80))  # head
-            bpy.ops.mesh.primitive_cylinder_add(radius=0.20, depth=0.60, location=(0, 0, 1.40))  # upper torso
-            bpy.ops.mesh.primitive_cylinder_add(radius=0.22, depth=0.40, location=(0, 0, 1.00))  # lower torso
-            bpy.ops.mesh.primitive_cylinder_add(radius=0.10, depth=0.70, location=(-0.25, 0, 1.25))  # arm L
-            bpy.ops.mesh.primitive_cylinder_add(radius=0.10, depth=0.70, location=( 0.25, 0, 1.25))  # arm R
-            bpy.ops.mesh.primitive_cylinder_add(radius=0.12, depth=1.00, location=(-0.12, 0, 0.40))  # leg L
-            bpy.ops.mesh.primitive_cylinder_add(radius=0.12, depth=1.00, location=( 0.12, 0, 0.40))  # leg R
+            parts = []
+            parts.append(bpy.ops.mesh.primitive_uv_sphere_add(radius=0.12, location=(0, 0, 1.80)))  # head
+            parts.append(bpy.ops.mesh.primitive_cylinder_add(radius=0.20, depth=0.60, location=(0, 0, 1.40)))  # upper torso
+            parts.append(bpy.ops.mesh.primitive_cylinder_add(radius=0.22, depth=0.40, location=(0, 0, 1.00)))  # lower torso
+            parts.append(bpy.ops.mesh.primitive_cylinder_add(radius=0.10, depth=0.70, location=(-0.25, 0, 1.25)))  # arm L
+            parts.append(bpy.ops.mesh.primitive_cylinder_add(radius=0.10, depth=0.70, location=( 0.25, 0, 1.25)))  # arm R
+            parts.append(bpy.ops.mesh.primitive_cylinder_add(radius=0.12, depth=1.00, location=(-0.12, 0, 0.40)))  # leg L
+            parts.append(bpy.ops.mesh.primitive_cylinder_add(radius=0.12, depth=1.00, location=( 0.12, 0, 0.40)))  # leg R
 
-        def scale_to_height(target_m):
-            # estimate current height by bounding box of all meshes
-            meshes = [o for o in bpy.data.objects if o.type == "MESH"]
-            if not meshes:
-                return
-            zmin, zmax = None, None
-            for o in meshes:
-                o.select_set(True)
-                bpy.context.view_layer.objects.active = o
-                bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='MEDIAN')
-                for v in o.bound_box:
-                    z = o.matrix_world @ bpy.mathutils.Vector(v)
-                o.select_set(False)
-            # use scene bounds
+        def scene_z_bounds():
             deps = bpy.context.evaluated_depsgraph_get()
             zmin, zmax = 1e9, -1e9
-            for o in meshes:
-                bb = o.evaluated_get(deps).bound_box
-                for v in bb:
-                    world_v = o.matrix_world @ bpy.mathutils.Vector((v[0],v[1],v[2]))
-                    zmin = min(zmin, world_v.z)
-                    zmax = max(zmax, world_v.z)
-            cur_h = max(0.01, zmax - zmin)
-            scale = target_m / cur_h
-            for o in meshes:
-                o.scale *= scale
+            for o in bpy.data.objects:
+                if o.type != "MESH":
+                    continue
+                eo = o.evaluated_get(deps)
+                M = eo.matrix_world
+                for x, y, z in eo.bound_box:
+                    v = M @ Vector((x, y, z))
+                    zmin = min(zmin, v.z)
+                    zmax = max(zmax, v.z)
+            if zmax < zmin:
+                return 0.0, 0.0, 0.0
+            return zmin, zmax, (zmax - zmin)
 
-        def add_camera_front_ortho(ortho_scale=2.2):
+        def scale_scene_to_height(target_m):
+            zmin, zmax, cur_h = scene_z_bounds()
+            if cur_h <= 0.0:
+                return
+            scale = target_m / cur_h
+            for o in bpy.data.objects:
+                if o.type in {"MESH", "ARMATURE", "EMPTY"}:
+                    o.scale *= scale
+
+        def add_camera_front_ortho(scale=2.3):
             cam = bpy.data.cameras.new("cam")
             cam.type = 'ORTHO'
-            cam.ortho_scale = ortho_scale
+            cam.ortho_scale = scale
             cam_obj = bpy.data.objects.new("cam", cam)
             bpy.context.scene.collection.objects.link(cam_obj)
-            # place in front and point to origin with Track To
-            cam_obj.location = (0, 3.0, 1.2)  # y positive, looking -Y
-            empty = bpy.data.objects.new("target", None)
-            bpy.context.scene.collection.objects.link(empty)
-            empty.location = (0, 0, 1.0)
+            cam_obj.location = (0.0, 3.0, 1.2)   # front
+            tgt = bpy.data.objects.new("target", None)
+            bpy.context.scene.collection.objects.link(tgt)
+            tgt.location = (0.0, 0.0, 1.0)
             con = cam_obj.constraints.new(type='TRACK_TO')
-            con.target = empty
+            con.target = tgt
             con.track_axis = 'TRACK_NEGATIVE_Z'
             con.up_axis = 'UP_Y'
             bpy.context.scene.camera = cam_obj
@@ -149,31 +151,35 @@ def run_blender_job(meas: Dict[str, Any], view: str, vp: Dict[str, Any]) -> Dict
             sc = bpy.context.scene
             sc.render.engine = 'CYCLES'
             sc.cycles.device = 'CPU'
-            sc.cycles.samples = 16
+            sc.cycles.samples = 8
             sc.cycles.use_adaptive_sampling = True
             sc.render.resolution_x = int(W)
             sc.render.resolution_y = int(H)
             sc.render.film_transparent = False
-            sc.view_layers["ViewLayer"].use_pass_combined = True
 
-        import sys, json, os
+        # args
         args = sys.argv[sys.argv.index("--")+1:]
         cfg_path, out_png = args[0], args[1]
         with open(cfg_path, "r") as f:
             cfg = json.load(f)
+
         W = cfg.get("W", 800)
         H = cfg.get("H", 1100)
         target_h_m = float(cfg.get("height_cm", 180.0)) / 100.0
 
         clear_scene()
         add_mannequin()
-        scale_to_height(target_h_m)
-        add_camera_front_ortho(ortho_scale=2.3)
+        scale_scene_to_height(target_h_m)
+        add_camera_front_ortho(scale=2.4)
         add_light()
         setup_cycles(W, H)
 
         bpy.context.scene.render.filepath = out_png
-        bpy.ops.render.render(write_still=True)
+        try:
+            bpy.ops.render.render(write_still=True)
+        except Exception as e:
+            import traceback, sys
+            sys.stderr.write("RENDER_ERROR: " + str(e) + "\\n" + traceback.format_exc())
     """)
 
     with tempfile.TemporaryDirectory() as td:
@@ -194,7 +200,7 @@ def run_blender_job(meas: Dict[str, Any], view: str, vp: Dict[str, Any]) -> Dict
         try:
             proc = subprocess.run(
                 [BLENDER_BIN, "-b", "-noaudio", "--python", job_path, "--", cfg_path, out_png],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=240, text=True
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300, text=True
             )
             rc = proc.returncode
             stdout = proc.stdout[-4000:] if proc.stdout else ""
@@ -213,7 +219,7 @@ def run_blender_job(meas: Dict[str, Any], view: str, vp: Dict[str, Any]) -> Dict
 
 @app.get("/")
 def root() -> Dict[str, str]:
-    return {"service": "tlr-avatar", "version": "blender_2"}
+    return {"service": "tlr-avatar", "version": "blender_3"}
 
 @app.get("/health")
 def health() -> Dict[str, bool]:
@@ -221,7 +227,7 @@ def health() -> Dict[str, bool]:
 
 @app.get("/blender/health")
 def blender_health() -> Dict[str, Any]:
-    return {"has_blender": blender_available(), "blender_path": BLENDER_BIN or ""}
+    return {"has_blender": BLENDER_BIN is not None, "blender_path": BLENDER_BIN or ""}
 
 @app.get("/blender/smoke")
 def blender_smoke() -> JSONResponse:
@@ -232,10 +238,8 @@ def blender_smoke() -> JSONResponse:
 def blender_smoke_view() -> HTMLResponse:
     res = run_blender_job({"height": 190, "units": "cm"}, "front", {"width": 800, "height": 1100})
     if res.get("ok") and res.get("png"):
-        html = f"<img style='max-width:100%' src='{res['png']}'/>"
-    else:
-        html = f"<pre>{json.dumps(res, indent=2)}</pre>"
-    return HTMLResponse(html)
+        return HTMLResponse(f"<img style='max-width:100%' src='{res['png']}'/>")
+    return HTMLResponse(f"<pre>{json.dumps(res, indent=2)}</pre>")
 
 @app.post("/avatar/render", response_model=RenderResponse)
 def avatar_render(payload: RenderRequest = Body(..., embed=False)) -> JSONResponse:
@@ -257,7 +261,6 @@ def avatar_render(payload: RenderRequest = Body(..., embed=False)) -> JSONRespon
     svg_out = ""
     engine_name = "blender"
     if not png_out:
-        # fall back to svg so UI never goes blank
         engine_name = "svg"
         svg_out = _fallback_svg(payload.viewport.width, payload.viewport.height)
 
