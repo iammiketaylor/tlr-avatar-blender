@@ -4,7 +4,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Tuple
+from typing import List, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
@@ -17,7 +17,7 @@ app = FastAPI(title="tlr-avatar-blender", version="1.0.0")
 
 # ---------- helpers ----------
 
-def _run(cmd: list[str], timeout: int = 480) -> Tuple[int, str, str]:
+def _run(cmd: List[str], timeout: int = 480) -> Tuple[int, str, str]:
     """Run a shell command and return (rc, stdout, stderr)."""
     try:
         proc = subprocess.run(
@@ -37,7 +37,6 @@ def _blender_version() -> str:
     rc, out, err = _run(["blender", "-v"], timeout=30)
     if rc != 0:
         raise RuntimeError(f"blender -v failed: {err or out}")
-    # one-line string is fine
     return (out or err).strip()
 
 
@@ -46,7 +45,6 @@ def _blender_test_script(out_png: Path, samples: int) -> str:
     A tiny Blender script that creates a lit sphere-on-plane,
     points the camera at it, and renders to out_png.
     """
-    # NOTE: this script runs *inside* Blender's Python (so we import bpy there).
     return f"""
 import bpy
 from mathutils import Vector
@@ -108,10 +106,9 @@ def _render_test_png(out_png: Path, samples: int = 8, timeout: int = 480) -> Tup
     Write a tiny blender script to a temp file, run blender headless to render out_png.
     Returns (stdout, stderr). Raises if Blender fails.
     """
-    # Ensure parent dir exists & remove any stale file
     out_png.parent.mkdir(parents=True, exist_ok=True)
     try:
-        out_png.unlink(missing_ok=True)  # py3.8+: use if exists then unlink
+        out_png.unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -123,13 +120,8 @@ def _render_test_png(out_png: Path, samples: int = 8, timeout: int = 480) -> Tup
         script_path = tf.name
 
     try:
-        # Run Blender headless with our script
-        rc, out, err = _run(
-            ["blender", "-b", "-noaudio", "-P", script_path],
-            timeout=timeout,
-        )
+        rc, out, err = _run(["blender", "-b", "-noaudio", "-P", script_path], timeout=timeout)
     finally:
-        # Best-effort cleanup of the temporary script
         try:
             Path(script_path).unlink(missing_ok=True)
         except Exception:
@@ -174,7 +166,6 @@ def blender_check():
 def render_test_raw_png():
     try:
         _render_test_png(TEST_PNG_PATH, samples=8, timeout=480)
-        # Serve the file directly
         return FileResponse(str(TEST_PNG_PATH), media_type="image/png", filename="blender_test.png")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -198,11 +189,10 @@ def render_test_png_b64():
             }
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)})
+        # <-- fixed: removed the stray "}"
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# Optional: run directly (Render usually starts with `uvicorn main:app ...`)
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=APP_PORT, reload=False)
