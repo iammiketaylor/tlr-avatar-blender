@@ -5,13 +5,19 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse, StreamingResponse, JSONResponse
 
 app = FastAPI(title="Blender Render API")
 
 BLENDER_BIN_CANDIDATES = ["blender", "/usr/bin/blender", "/usr/local/bin/blender"]
 PNG_PATH = "/tmp/blender_test.png"
+
+
+@app.get("/", response_class=PlainTextResponse)
+def root():
+    # Render hits GET / for health. Return 200 and point humans at the useful endpoints.
+    return "ok – try /healthz, /blender/check, /render/test, or /render/test.png"
 
 
 def find_blender() -> str:
@@ -26,43 +32,32 @@ def find_blender() -> str:
 
 
 def build_blender_script(out_path: str, samples: int = 32) -> str:
-    """
-    Headless scene builder: Cycles CPU, emissive sphere, area light, gray plane,
-    dim world background, camera pointed at the sphere. Writes PNG to out_path.
-    """
     return f"""
 import bpy
 import mathutils
 
-# Start clean
 bpy.ops.wm.read_factory_settings(use_empty=True)
-
-# Engine
 scene = bpy.context.scene
 scene.render.engine = 'CYCLES'
 scene.cycles.device = 'CPU'
 scene.cycles.samples = {samples}
-
-# Color management: fall back to Standard if Filmic isn't available
 try:
     scene.display_settings.display_device = 'sRGB'
     scene.view_settings.view_transform = 'Standard'
 except Exception:
     pass
 
-# World (dim, non-black)
 if scene.world is None:
     scene.world = bpy.data.worlds.new("World")
 scene.world.use_nodes = True
 wn = scene.world.node_tree
 wn.nodes.clear()
 n_bg = wn.nodes.new('ShaderNodeBackground')
-n_bg.inputs[0].default_value = (0.02, 0.02, 0.03, 1.0)  # slightly above black so it's never pure black
+n_bg.inputs[0].default_value = (0.02, 0.02, 0.03, 1.0)
 n_bg.inputs[1].default_value = 1.0
 n_out = wn.nodes.new('ShaderNodeOutputWorld')
 wn.links.new(n_bg.outputs['Background'], n_out.inputs['Surface'])
 
-# Plane
 bpy.ops.mesh.primitive_plane_add(size=6, location=(0, 0, 0))
 plane = bpy.context.object
 m_plane = bpy.data.materials.new("PlaneMat")
@@ -72,7 +67,6 @@ p_bsdf.inputs["Base Color"].default_value = (0.2, 0.2, 0.22, 1.0)
 p_bsdf.inputs["Roughness"].default_value = 1.0
 plane.data.materials.append(m_plane)
 
-# Sphere (emissive so it shows even with no lights)
 bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, location=(0, 0, 1.0))
 sphere = bpy.context.object
 m_emit = bpy.data.materials.new("EmitMat")
@@ -82,19 +76,17 @@ for n in list(nodes):
     if n.type != 'OUTPUT_MATERIAL':
         nodes.remove(n)
 n_em = nodes.new('ShaderNodeEmission')
-n_em.inputs['Color'].default_value = (1.0, 0.5, 0.1, 1.0)  # orange
+n_em.inputs['Color'].default_value = (1.0, 0.5, 0.1, 1.0)
 n_em.inputs['Strength'].default_value = 5.0
 n_outm = nodes['Material Output']
 m_emit.node_tree.links.new(n_em.outputs['Emission'], n_outm.inputs['Surface'])
 sphere.data.materials.append(m_emit)
 
-# Area Light (adds nice highlights/shadows in headless Cycles)
 bpy.ops.object.light_add(type='AREA', location=(2, -2, 3))
 light = bpy.context.object
 light.data.energy = 3000.0
 light.data.size = 2.0
 
-# Camera
 bpy.ops.object.camera_add(location=(3, -3, 2))
 cam = bpy.context.object
 scene.camera = cam
@@ -105,14 +97,12 @@ def look_at(obj, target):
 
 look_at(cam, (0, 0, 1.0))
 
-# Render settings
 scene.render.resolution_x = 768
 scene.render.resolution_y = 768
 scene.render.film_transparent = False
 scene.render.image_settings.file_format = 'PNG'
 scene.render.filepath = r'{out_path}'
 
-# Render
 bpy.ops.render.render(write_still=True)
 print("Saved:", scene.render.filepath)
 """
@@ -141,18 +131,14 @@ def run_blender_and_get_png(samples: int = 32, timeout_s: int = 480):
         except Exception:
             pass
 
-    stdout = proc.stdout
-    stderr = proc.stderr
-    rc = proc.returncode
-
-    if rc != 0:
-        raise HTTPException(status_code=500, detail=f"Blender failed (rc={rc}). See logs.")
+    if proc.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"Blender failed (rc={proc.returncode}). See logs.")
 
     if not Path(PNG_PATH).exists():
         raise HTTPException(status_code=500, detail="PNG not written (expected at /tmp/blender_test.png).")
 
     data = Path(PNG_PATH).read_bytes()
-    return data, stdout, stderr
+    return data, proc.stdout, proc.stderr
 
 
 @app.get("/healthz", response_class=PlainTextResponse)
@@ -176,10 +162,10 @@ def render_test(samples: int = 32):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))  # ← fixed brace
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/render/test.png")  # JSON with base64 + logs (for debugging)
+@app.get("/render/test.png")  # JSON with base64 + logs
 def render_test_json(samples: int = 32):
     try:
         data, stdout, stderr = run_blender_and_get_png(samples=samples)
@@ -201,7 +187,7 @@ def render_test_json(samples: int = 32):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Convenience aliases you might have bookmarked earlier
+# Convenience aliases if you bookmarked earlier names
 @app.get("/render/test-raw")
 def render_test_raw_alias(samples: int = 32):
     return render_test(samples=samples)
