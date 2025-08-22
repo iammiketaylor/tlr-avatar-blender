@@ -1,172 +1,187 @@
-# main.py  blender_cycles_safe
-from typing import Dict, Any
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
-import base64, json, os, subprocess, tempfile, textwrap, shutil
+# main.py  — drop-in Flask app that renders a bright PNG via Blender headless
+import os, base64, tempfile, subprocess, textwrap, time
+from pathlib import Path
+from flask import Flask, jsonify, Response, request
 
-app = FastAPI(title="TLR Avatar Render Service", version="blender_cycles_safe")
+app = Flask(__name__)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+SERVICE_NAME = "tlr-avatar"
+SERVICE_VERSION = "1.0.0"
+
+def find_blender():
+    candidates = [
+        os.environ.get("BLENDER_PATH"),
+        "/usr/bin/blender",
+        "/opt/blender/blender",
+    ]
+    for p in candidates:
+        if p and Path(p).exists():
+            return p
+    return None
+
+BLENDER_PATH = find_blender()
+
+def run_blender_job(job_py: str):
+    """Run a small Blender job in headless mode and return dict with png/rc/out."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="bl_job_"))
+    job_path = tmpdir / "job.py"
+    out_path = tmpdir / "out.png"
+
+    # write the job script
+    job_path.write_text(job_py)
+
+    # pick blender
+    if not BLENDER_PATH:
+        return dict(ok=False, rc=127, png=b"", stdout="", stderr="Blender not found")
+
+    env = os.environ.copy()
+    env["PNG_OUT"] = str(out_path)
+
+    # run blender headless
+    cmd = [
+        BLENDER_PATH,
+        "-noaudio",
+        "-b",               # background (no window)
+        "-P", str(job_path) # run python script
+    ]
+    proc = subprocess.run(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=180,
+    )
+    stdout = proc.stdout
+    stderr = proc.stderr
+    rc = proc.returncode
+
+    png_bytes = out_path.read_bytes() if out_path.exists() else b""
+    return dict(ok=(rc == 0 and len(png_bytes) > 0), rc=rc, png=png_bytes, stdout=stdout, stderr=stderr)
+
+BRIGHT_SPHERE_JOB = textwrap.dedent(r"""
+import bpy, bmesh, os
+from math import radians
+from mathutils import Vector
+
+# Reset to empty factory scene
+bpy.ops.wm.read_factory_settings(use_empty=True)
+scene = bpy.context.scene
+
+# Use Eevee and a standard view so we don't depend on Filmic
+scene.render.engine = 'BLENDER_EEVEE'
+scene.view_settings.view_transform = 'Standard'
+
+# Make world bright white (so nothing is black even without lights)
+if scene.world is None:
+    scene.world = bpy.data.worlds.new("World")
+scene.world.use_nodes = True
+wn = scene.world.node_tree
+for n in list(wn.nodes):
+    wn.nodes.remove(n)
+bg = wn.nodes.new('ShaderNodeBackground')
+bg.inputs['Color'].default_value = (1.0, 1.0, 1.0, 1.0)
+bg.inputs['Strength'].default_value = 1.0
+out = wn.nodes.new('ShaderNodeOutputWorld')
+wn.links.new(bg.outputs['Background'], out.inputs['Surface'])
+
+# Add a simple sphere with an emission material (guaranteed to be visible)
+mesh = bpy.data.meshes.new("BodyMesh")
+bm = bmesh.new()
+bmesh.ops.create_uvsphere(bm, u_segments=32, v_segments=16, radius=0.6)
+bm.to_mesh(mesh); bm.free()
+obj = bpy.data.objects.new("Body", mesh)
+bpy.context.collection.objects.link(obj)
+
+mat = bpy.data.materials.new("EmissiveMat")
+mat.use_nodes = True
+nt = mat.node_tree
+for n in list(nt.nodes):
+    nt.nodes.remove(n)
+em = nt.nodes.new('ShaderNodeEmission')
+em.inputs['Color'].default_value = (0.12, 0.40, 0.80, 1.0)
+em.inputs['Strength'].default_value = 3.0
+mout = nt.nodes.new('ShaderNodeOutputMaterial')
+nt.links.new(em.outputs['Emission'], mout.inputs['Surface'])
+obj.data.materials.append(mat)
+
+# Add a light (EeVee likes one, even though we have emission)
+sun_data = bpy.data.lights.new(name="Sun", type='SUN')
+sun = bpy.data.objects.new(name="Sun", object_data=sun_data)
+bpy.context.collection.objects.link(sun)
+sun.location = (0.0, -2.0, 5.0)
+sun.data.energy = 3.0
+
+# Camera looking at origin
+cam_data = bpy.data.cameras.new("Cam")
+cam = bpy.data.objects.new("Cam", cam_data)
+bpy.context.collection.objects.link(cam)
+cam.location = (0.0, -3.0, 1.5)
+cam.rotation_euler = (radians(15), 0.0, 0.0)
+scene.camera = cam
+
+# Render settings
+scene.render.resolution_x = 800
+scene.render.resolution_y = 800
+scene.render.film_transparent = False
+
+# Render to the path Blender was given via env
+out_path = os.environ.get("PNG_OUT", "/tmp/out.png")
+bpy.ops.render.render(write_still=False)
+bpy.data.images['Render Result'].save_render(out_path)
+""").strip()
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "tlr-avatar", "version": "blender_cycles_safe"}
+    return jsonify(dict(service=SERVICE_NAME, version=SERVICE_VERSION))
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-BLENDER_BIN = shutil.which("blender")
-
-@app.get("/blender/health")
-def blender_health():
-    return {"has_blender": BLENDER_BIN is not None, "blender_path": BLENDER_BIN or ""}
-
-def run_blender_smoke(W: int = 800, H: int = 1100, height_cm: float = 190) -> Dict[str, Any]:
-    if not BLENDER_BIN:
-        return {"ok": False, "png": "", "rc": -1, "stdout": "", "stderr": "blender_not_found"}
-
-    pycode = textwrap.dedent("""
-        import bpy, sys, json, math
-        from mathutils import Vector
-
-        def clear():
-            bpy.ops.wm.read_homefile(use_empty=True)
-            for o in list(bpy.data.objects):
-                try: bpy.data.objects.remove(o, do_unlink=True)
-                except: pass
-
-        def mat():
-            m = bpy.data.materials.new("BodyMat")
-            m.use_nodes = True
-            bsdf = m.node_tree.nodes.get("Principled BSDF")
-            bsdf.inputs["Base Color"].default_value = (0.7,0.72,0.75,1.0)
-            bsdf.inputs["Roughness"].default_value = 0.6
-            return m
-
-        def add_parts(M):
-            def add(op, **kw):
-                getattr(bpy.ops.mesh, op)(**kw)
-                o = bpy.context.active_object
-                if o and o.data and hasattr(o.data,"materials"):
-                    if not o.data.materials: o.data.materials.append(M)
-                    else: o.data.materials[0] = M
-            add("primitive_uv_sphere_add", radius=0.12, location=(0,0,1.80))
-            add("primitive_cylinder_add", radius=0.20, depth=0.60, location=(0,0,1.40))
-            add("primitive_cylinder_add", radius=0.22, depth=0.40, location=(0,0,1.00))
-            add("primitive_cylinder_add", radius=0.10, depth=0.70, location=(-0.25,0,1.25))
-            add("primitive_cylinder_add", radius=0.10, depth=0.70, location=( 0.25,0,1.25))
-            add("primitive_cylinder_add", radius=0.12, depth=1.00, location=(-0.12,0,0.40))
-            add("primitive_cylinder_add", radius=0.12, depth=1.00, location=( 0.12,0,0.40))
-
-        def world_and_light():
-            if bpy.context.scene.world is None:
-                bpy.context.scene.world = bpy.data.worlds.new("World")
-            w = bpy.context.scene.world
-            w.use_nodes = True
-            bg = w.node_tree.nodes.get("Background")
-            if bg:
-                bg.inputs[0].default_value = (1,1,1,1)
-                bg.inputs[1].default_value = 5.0
-            sun = bpy.data.lights.new("sun","SUN")
-            sun.energy = 5.0
-            so = bpy.data.objects.new("sun",sun)
-            bpy.context.scene.collection.objects.link(so)
-            so.location = (3.0,2.0,4.0)
-            so.rotation_euler = (math.radians(50),0,math.radians(-20))
-
-        def camera_ortho(scale=2.8):
-            cam = bpy.data.cameras.new("cam"); cam.type='ORTHO'; cam.ortho_scale = scale
-            co = bpy.data.objects.new("cam", cam)
-            bpy.context.scene.collection.objects.link(co)
-            co.location = (0.0,-5.0,1.2)
-            tgt = bpy.data.objects.new("target", None)
-            bpy.context.scene.collection.objects.link(tgt)
-            tgt.location = (0.0,0.0,1.0)
-            con = co.constraints.new(type='TRACK_TO'); con.target = tgt
-            con.track_axis='TRACK_NEGATIVE_Z'; con.up_axis='UP_Y'
-            bpy.context.scene.camera = co
-
-        def setup_cycles(W,H):
-            sc = bpy.context.scene
-            sc.render.engine = 'CYCLES'
-            sc.cycles.device = 'CPU'
-            sc.cycles.samples = 8
-            sc.cycles.use_adaptive_sampling = True
-            sc.view_settings.view_transform = 'Standard'
-            sc.render.resolution_x = int(W)
-            sc.render.resolution_y = int(H)
-            sc.render.film_transparent = False
-            sc.render.image_settings.file_format = 'PNG'
-
-        args = sys.argv[sys.argv.index("--")+1:]
-        cfg_path, out_png = args[0], args[1]
-        with open(cfg_path,"r") as f: cfg = json.load(f)
-        W = cfg.get("W",800); H = cfg.get("H",1100); height_cm = cfg.get("height_cm",190)
-
-        clear()
-        add_parts(mat())
-        world_and_light()
-        camera_ortho()
-        setup_cycles(W,H)
-
-        # scale to height after everything is placed
-        from mathutils import Vector
-        deps = bpy.context.evaluated_depsgraph_get()
-        zmin,zmax = 1e9,-1e9
-        for o in bpy.data.objects:
-            if o.type!="MESH": continue
-            eo = o.evaluated_get(deps); M = eo.matrix_world
-            for x,y,z in eo.bound_box:
-                v = M @ Vector((x,y,z))
-                zmin = min(zmin,v.z); zmax = max(zmax,v.z)
-        cur_h = max(0.01, zmax - zmin)
-        s = (height_cm/100.0)/cur_h
-        for o in bpy.data.objects:
-            if o.type in {"MESH","ARMATURE","EMPTY"}:
-                o.scale *= s
-
-        bpy.ops.render.render(write_still=True)
-        bpy.data.images['Render Result'].save_render(out_png)
-    """)
-
-    with tempfile.TemporaryDirectory() as td:
-        cfg = {"W": W, "H": H, "height_cm": height_cm}
-        cfg_path = os.path.join(td, "cfg.json")
-        out_png = os.path.join(td, "out.png")
-        open(cfg_path, "w").write(json.dumps(cfg))
-        job = os.path.join(td, "job.py"); open(job, "w").write(pycode)
-
-        try:
-            proc = subprocess.run([BLENDER_BIN, "-b", "-noaudio", "--python", job, "--", cfg_path, out_png],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300, text=True)
-            rc = proc.returncode
-            stdout = proc.stdout[-4000:] if proc.stdout else ""
-            stderr = proc.stderr[-4000:] if proc.stderr else ""
-        except Exception as e:
-            return {"ok": False, "png": "", "rc": -2, "stdout": "", "stderr": f"{type(e).__name__}: {e}"}
-
-        if rc != 0 or not os.path.exists(out_png):
-            return {"ok": False, "png": "", "rc": rc, "stdout": stdout, "stderr": stderr}
-
-        b64 = base64.b64encode(open(out_png, "rb").read()).decode("ascii")
-        return {"ok": True, "png": "data:image/png;base64,"+b64, "rc": rc, "stdout": stdout, "stderr": stderr}
+@app.get("/blender/check")
+def blender_check():
+    return jsonify(dict(has_blender=bool(BLENDER_PATH), blender_path=BLENDER_PATH or ""))
 
 @app.get("/blender/smoke")
 def blender_smoke():
-    res = run_blender_smoke(800, 1100, 190)
-    return JSONResponse(res)
+    """Return a JSON payload with base64 PNG (or raw PNG if ?as=png)."""
+    res = run_blender_job(BRIGHT_SPHERE_JOB)
+
+    # If the caller wants raw PNG bytes (for <img src>), serve it directly
+    if request.args.get("as") == "png" and res["ok"]:
+        return Response(res["png"], mimetype="image/png",
+                        headers={"Cache-Control": "no-store"})
+    # Otherwise, return JSON with data URL (or errors)
+    b64 = base64.b64encode(res["png"]).decode("ascii") if res["png"] else ""
+    return jsonify(dict(
+        ok=res["ok"],
+        rc=res["rc"],
+        stdout=res["stdout"],
+        stderr=res["stderr"],
+        png=("data:image/png;base64," + b64) if b64 else ""
+    ))
 
 @app.get("/blender/smoke_view")
 def blender_smoke_view():
-    res = run_blender_smoke(800, 1100, 190)
-    if res.get("ok") and res.get("png"):
-        return HTMLResponse(f"<img style='max-width:100%;background:#fff' src='{res['png']}'/>")
-    return HTMLResponse(f"<pre>{json.dumps(res, indent=2)}</pre>")
+    """Server-side render & inline the PNG so adblockers/caching can’t hide it."""
+    res = run_blender_job(BRIGHT_SPHERE_JOB)
+    if res["ok"]:
+        b64 = base64.b64encode(res["png"]).decode("ascii")
+        body = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Blender PNG</title></head>
+<body style="margin:0;background:#fff;">
+  <img alt="render" style="display:block;max-width:96vw;height:auto;background:#fff;"
+       src="data:image/png;base64,{b64}">
+  <pre style="white-space:pre-wrap;padding:12px;background:#fff;color:#333;border-top:1px solid #ddd">
+rc={res["rc"]}</pre>
+</body></html>"""
+    else:
+        # Show errors plainly
+        body = f"""<!doctype html><html><body style="font:14px/1.4 system-ui;white-space:pre-wrap">
+<h3>Render failed</h3>
+<code>rc={res["rc"]}</code>
+<h4>stderr</h4><pre>{res["stderr"]}</pre>
+<h4>stdout</h4><pre>{res["stdout"]}</pre>
+</body></html>"""
+    return Response(body, mimetype="text/html", headers={"Cache-Control": "no-store"})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
