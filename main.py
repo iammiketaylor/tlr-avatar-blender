@@ -4,175 +4,155 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Tuple
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import PlainTextResponse, StreamingResponse, JSONResponse
 
-APP_PORT = int(os.getenv("PORT", "10000"))
-TEST_PNG_PATH = Path("/tmp/blender_test.png")
+app = FastAPI(title="Blender Render API")
 
-app = FastAPI(title="tlr-avatar-blender", version="1.1.0")
-
-
-# ---------- helpers ----------
-
-def _run(cmd: List[str], timeout: int = 480) -> Tuple[int, str, str]:
-    """Run a shell command and return (rc, stdout, stderr)."""
-    try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
-            text=True,
-        )
-        return proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired as e:
-        return 124, e.stdout or "", e.stderr or "timeout"
+BLENDER_BIN_CANDIDATES = ["blender", "/usr/bin/blender", "/usr/local/bin/blender"]
+PNG_PATH = "/tmp/blender_test.png"
 
 
-def _blender_version() -> str:
-    rc, out, err = _run(["blender", "-v"], timeout=30)
-    if rc != 0:
-        raise RuntimeError(f"blender -v failed: {err or out}")
-    return (out or err).strip()
+def find_blender() -> str:
+    for p in BLENDER_BIN_CANDIDATES:
+        try:
+            r = subprocess.run([p, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+            if r.returncode == 0:
+                return p
+        except Exception:
+            pass
+    raise HTTPException(status_code=500, detail="Blender binary not found in container.")
 
 
-def _blender_test_script(out_png: Path, samples: int) -> str:
+def build_blender_script(out_path: str, samples: int = 32) -> str:
     """
-    A tiny Blender script that creates a guaranteed-not-black scene and renders to out_png.
-    - World background > 0
-    - Sun + Point lights
-    - Emissive sphere
-    - Camera aimed at sphere
+    Headless scene builder: Cycles CPU, emissive sphere, area light, gray plane,
+    dim world background, camera pointed at the sphere. Writes PNG to out_path.
     """
     return f"""
 import bpy
-from mathutils import Vector
+import mathutils
 
-# Reset to empty scene
+# Start clean
 bpy.ops.wm.read_factory_settings(use_empty=True)
-scene = bpy.context.scene
 
-# ---- color management (headless fallback safe)
+# Engine
+scene = bpy.context.scene
+scene.render.engine = 'CYCLES'
+scene.cycles.device = 'CPU'
+scene.cycles.samples = {samples}
+
+# Color management: fall back to Standard if Filmic isn't available
 try:
-    scene.view_settings.view_transform = 'Standard'
     scene.display_settings.display_device = 'sRGB'
+    scene.view_settings.view_transform = 'Standard'
 except Exception:
     pass
 
-# ---- world: medium-dark ambient so it's not pitch black
-world = bpy.data.worlds.get('World') or bpy.data.worlds.new('World')
-bpy.context.scene.world = world
-world.use_nodes = True
-bg = world.node_tree.nodes.get('Background')
-if bg:
-    bg.inputs[0].default_value = (0.20, 0.20, 0.20, 1.0)  # mid-dark grey
-    bg.inputs[1].default_value = 1.0
+# World (dim, non-black)
+if scene.world is None:
+    scene.world = bpy.data.worlds.new("World")
+scene.world.use_nodes = True
+wn = scene.world.node_tree
+wn.nodes.clear()
+n_bg = wn.nodes.new('ShaderNodeBackground')
+n_bg.inputs[0].default_value = (0.02, 0.02, 0.03, 1.0)  # slightly above black so it's never pure black
+n_bg.inputs[1].default_value = 1.0
+n_out = wn.nodes.new('ShaderNodeOutputWorld')
+wn.links.new(n_bg.outputs['Background'], n_out.inputs['Surface'])
 
-# ---- camera
-cam = bpy.data.cameras.new("Cam")
-cam_obj = bpy.data.objects.new("Cam", cam)
-bpy.context.scene.collection.objects.link(cam_obj)
-cam_obj.location = (3.0, -3.0, 2.0)
+# Plane
+bpy.ops.mesh.primitive_plane_add(size=6, location=(0, 0, 0))
+plane = bpy.context.object
+m_plane = bpy.data.materials.new("PlaneMat")
+m_plane.use_nodes = True
+p_bsdf = m_plane.node_tree.nodes.get("Principled BSDF")
+p_bsdf.inputs["Base Color"].default_value = (0.2, 0.2, 0.22, 1.0)
+p_bsdf.inputs["Roughness"].default_value = 1.0
+plane.data.materials.append(m_plane)
 
-# ---- objects: sphere (emissive) and ground plane
-bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, location=(0.0, 0.0, 1.0))
-sphere = bpy.context.active_object
-bpy.ops.mesh.primitive_plane_add(size=8.0, location=(0.0, 0.0, 0.0))
-
-# Make sphere emissive so it shows up even if lights fail
-mat = bpy.data.materials.new("MatEmission")
-mat.use_nodes = True
-nodes = mat.node_tree.nodes
+# Sphere (emissive so it shows even with no lights)
+bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, location=(0, 0, 1.0))
+sphere = bpy.context.object
+m_emit = bpy.data.materials.new("EmitMat")
+m_emit.use_nodes = True
+nodes = m_emit.node_tree.nodes
 for n in list(nodes):
-    nodes.remove(n)
-out_node = nodes.new("ShaderNodeOutputMaterial")
-em_node = nodes.new("ShaderNodeEmission")
-em_node.inputs["Color"].default_value = (0.9, 0.4, 0.2, 1.0)
-em_node.inputs["Strength"].default_value = 5.0
-mat.node_tree.links.new(em_node.outputs["Emission"], out_node.inputs["Surface"])
-sphere.data.materials.clear()
-sphere.data.materials.append(mat)
+    if n.type != 'OUTPUT_MATERIAL':
+        nodes.remove(n)
+n_em = nodes.new('ShaderNodeEmission')
+n_em.inputs['Color'].default_value = (1.0, 0.5, 0.1, 1.0)  # orange
+n_em.inputs['Strength'].default_value = 5.0
+n_outm = nodes['Material Output']
+m_emit.node_tree.links.new(n_em.outputs['Emission'], n_outm.inputs['Surface'])
+sphere.data.materials.append(m_emit)
 
-# ---- aim camera at sphere
-def look_at(obj, target_vec):
-    direction = (Vector(target_vec) - obj.location).normalized()
+# Area Light (adds nice highlights/shadows in headless Cycles)
+bpy.ops.object.light_add(type='AREA', location=(2, -2, 3))
+light = bpy.context.object
+light.data.energy = 3000.0
+light.data.size = 2.0
+
+# Camera
+bpy.ops.object.camera_add(location=(3, -3, 2))
+cam = bpy.context.object
+scene.camera = cam
+
+def look_at(obj, target):
+    direction = mathutils.Vector(target) - obj.location
     obj.rotation_euler = direction.to_track_quat('-Z', 'Y').to_euler()
-look_at(cam_obj, sphere.location)
 
-# ---- lights: sun + point
-sun = bpy.data.lights.new(name="Sun", type='SUN')
-sun.energy = 3.0
-sun_obj = bpy.data.objects.new(name="Sun", object_data=sun)
-bpy.context.scene.collection.objects.link(sun_obj)
-sun_obj.location = (4.0, -4.0, 6.0)
-sun_obj.rotation_euler = (0.8, 0.0, 0.8)
+look_at(cam, (0, 0, 1.0))
 
-pt = bpy.data.lights.new(name="KeyPoint", type='POINT')
-pt.energy = 2000.0
-pt_obj = bpy.data.objects.new(name="KeyPoint", object_data=pt)
-bpy.context.scene.collection.objects.link(pt_obj)
-pt_obj.location = (1.5, -1.5, 2.5)
-
-# ---- render settings (Cycles CPU)
-scene.render.engine = 'CYCLES'
-scene.cycles.device = 'CPU'
-scene.cycles.samples = int({samples})
-scene.render.resolution_x = 512
-scene.render.resolution_y = 512
-scene.render.resolution_percentage = 100
-scene.camera = cam_obj
-
-# output
+# Render settings
+scene.render.resolution_x = 768
+scene.render.resolution_y = 768
+scene.render.film_transparent = False
 scene.render.image_settings.file_format = 'PNG'
-scene.render.filepath = r"{str(out_png)}"
+scene.render.filepath = r'{out_path}'
+
+# Render
 bpy.ops.render.render(write_still=True)
+print("Saved:", scene.render.filepath)
 """
 
 
-def _render_test_png(out_png: Path, samples: int = 8, timeout: int = 480) -> Tuple[str, str]:
-    """
-    Write a tiny blender script to a temp file, run blender headless to render out_png.
-    Returns (stdout, stderr). Raises if Blender fails.
-    """
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        out_png.unlink(missing_ok=True)
-    except Exception:
-        pass
+def run_blender_and_get_png(samples: int = 32, timeout_s: int = 480):
+    blender = find_blender()
+    Path(PNG_PATH).unlink(missing_ok=True)
 
-    script_text = _blender_test_script(out_png, samples)
-
+    script = build_blender_script(PNG_PATH, samples=samples)
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tf:
-        tf.write(script_text)
-        tf.flush()
-        script_path = tf.name
+        tf.write(script)
+        tf_path = tf.name
 
     try:
-        rc, out, err = _run(["blender", "-b", "-noaudio", "-P", script_path], timeout=timeout)
+        proc = subprocess.run(
+            [blender, "-b", "-noaudio", "-P", tf_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_s,
+            text=True,
+        )
     finally:
         try:
-            Path(script_path).unlink(missing_ok=True)
+            os.remove(tf_path)
         except Exception:
             pass
 
+    stdout = proc.stdout
+    stderr = proc.stderr
+    rc = proc.returncode
+
     if rc != 0:
-        raise RuntimeError(f"Blender failed (rc={rc}): {err or out}")
+        raise HTTPException(status_code=500, detail=f"Blender failed (rc={rc}). See logs.")
 
-    if not out_png.exists() or out_png.stat().st_size == 0:
-        raise RuntimeError("Blender reported success but no PNG was written.")
+    if not Path(PNG_PATH).exists():
+        raise HTTPException(status_code=500, detail="PNG not written (expected at /tmp/blender_test.png).")
 
-    return out, err
-
-
-# ---------- routes ----------
-
-@app.get("/", response_class=PlainTextResponse)
-def root():
-    return "tlr-avatar-blender is running. Try /healthz, /blender/check, /render/test (file), or /render/test.png (JSON+b64)."
+    data = Path(PNG_PATH).read_bytes()
+    return data, stdout, stderr
 
 
 @app.get("/healthz", response_class=PlainTextResponse)
@@ -180,65 +160,53 @@ def healthz():
     return "ok"
 
 
-@app.get("/ok")
-def ok():
-    return {"ok": True}
-
-
 @app.get("/blender/check")
 def blender_check():
+    blender = find_blender()
+    r = subprocess.run([blender, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+    return {"ok": True, "version": r.stdout.splitlines()[0].strip() if r.stdout else "unknown"}
+
+
+@app.get("/render/test")  # direct PNG download
+def render_test(samples: int = 32):
     try:
-        ver = _blender_version()
-        return {"ok": True, "version": ver}
+        data, _, _ = run_blender_and_get_png(samples=samples)
+        headers = {"Content-Disposition": 'attachment; filename="blender_test.png"'}
+        return StreamingResponse(iter([data]), media_type="image/png", headers=headers)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))  # ← fixed brace
 
 
-# --- render: file (multiple aliases so it's easy to hit)
-
-def _file_response_or_500() -> FileResponse:
+@app.get("/render/test.png")  # JSON with base64 + logs (for debugging)
+def render_test_json(samples: int = 32):
     try:
-        _render_test_png(TEST_PNG_PATH, samples=8, timeout=480)
-        return FileResponse(str(TEST_PNG_PATH), media_type="image/png", filename="blender_test.png")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/render/test.raw.png")
-def render_test_raw_png():
-    return _file_response_or_500()
-
-@app.get("/render/test-raw")
-def render_test_raw_alias1():
-    return _file_response_or_500()
-
-@app.get("/render/test")
-def render_test_raw_alias2():
-    return _file_response_or_500()
-
-
-# --- render: JSON with base64 and logs
-
-@app.get("/render/test.png")
-def render_test_png_b64():
-    try:
-        out, err = _render_test_png(TEST_PNG_PATH, samples=8, timeout=480)
-        data = TEST_PNG_PATH.read_bytes()
+        data, stdout, stderr = run_blender_and_get_png(samples=samples)
         b64 = base64.b64encode(data).decode("ascii")
         return JSONResponse(
             {
                 "ok": True,
                 "engine": "CYCLES-CPU",
-                "samples": 8,
+                "samples": samples,
                 "timeout_s": 480,
-                "png": f"data:image/png;base64,{b64}",
-                "stdout": out,
-                "stderr": err,
+                "png": "data:image/png;base64," + b64,
+                "stdout": stdout,
+                "stderr": stderr,
             }
         )
+    except HTTPException as e:
+        raise e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=APP_PORT, reload=False)
+# Convenience aliases you might have bookmarked earlier
+@app.get("/render/test-raw")
+def render_test_raw_alias(samples: int = 32):
+    return render_test(samples=samples)
+
+
+@app.get("/render/test.raw.png")
+def render_test_dotraw_alias(samples: int = 32):
+    return render_test(samples=samples)
