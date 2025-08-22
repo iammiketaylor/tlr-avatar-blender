@@ -1,4 +1,4 @@
-# main.py  blender_4  visible EEVEE render with bright world and correct camera
+# main.py  blender_cycles_1  headless Cycles CPU PNG with clear lighting and camera
 
 from typing import List, Optional, Literal, Dict, Any
 from fastapi import FastAPI, Body
@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, Field
 import base64, json, os, subprocess, tempfile, textwrap, shutil
 
-app = FastAPI(title="TLR Avatar Render Service", version="blender_4")
+app = FastAPI(title="TLR Avatar Render Service", version="blender_cycles_1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,7 +41,7 @@ class RenderRequest(BaseModel):
     view: Literal["front", "back", "side"] = "front"
     return_: List[Literal["svg", "png"]] = Field(default_factory=lambda: ["svg"], alias="return")
     viewport: Viewport = Viewport()
-    engine: Optional[Literal["svg","blender"]] = None
+    engine: Optional[Literal["svg","blender"]] = None  # set to blender to force PNG
 
 class RenderResponse(BaseModel):
     svg: str = ""
@@ -59,15 +59,12 @@ def _fallback_svg(w: int, h: int) -> str:
 </svg>"""
 
 BLENDER_BIN = shutil.which("blender")
-
-def blender_available() -> bool:
-    return BLENDER_BIN is not None
+def blender_available() -> bool: return BLENDER_BIN is not None
 
 def run_blender_job(meas: Dict[str, Any], view: str, vp: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Headless Blender render with EEVEE.
-    Bright white world, sun light, orthographic camera in front that tracks the figure.
-    Returns { ok, png, rc, stdout, stderr }.
+    Headless Blender with Cycles CPU. Builds a simple mannequin and renders a PNG.
+    Returns { ok, png, rc, stdout, stderr } with errors surfaced.
     """
     if not blender_available():
         return {"ok": False, "png": "", "rc": -1, "stdout": "", "stderr": "blender_not_found"}
@@ -79,10 +76,8 @@ def run_blender_job(meas: Dict[str, Any], view: str, vp: Dict[str, Any]) -> Dict
         def clear_scene():
             bpy.ops.wm.read_homefile(use_empty=True)
             for o in list(bpy.data.objects):
-                try:
-                    bpy.data.objects.remove(o, do_unlink=True)
-                except Exception:
-                    pass
+                try: bpy.data.objects.remove(o, do_unlink=True)
+                except: pass
 
         def add_mannequin():
             bpy.ops.mesh.primitive_uv_sphere_add(radius=0.12, location=(0, 0, 1.80))  # head
@@ -93,150 +88,116 @@ def run_blender_job(meas: Dict[str, Any], view: str, vp: Dict[str, Any]) -> Dict
             bpy.ops.mesh.primitive_cylinder_add(radius=0.12, depth=1.00, location=(-0.12, 0, 0.40))  # leg L
             bpy.ops.mesh.primitive_cylinder_add(radius=0.12, depth=1.00, location=( 0.12, 0, 0.40))  # leg R
 
-        def scene_height():
+        def bounds_height():
             deps = bpy.context.evaluated_depsgraph_get()
             zmin, zmax = 1e9, -1e9
             for o in bpy.data.objects:
-                if o.type != "MESH":
-                    continue
+                if o.type != "MESH": continue
                 eo = o.evaluated_get(deps)
                 M = eo.matrix_world
-                for x, y, z in eo.bound_box:
-                    v = M @ Vector((x, y, z))
-                    zmin = min(zmin, v.z)
-                    zmax = max(zmax, v.z)
+                for x,y,z in eo.bound_box:
+                    v = M @ Vector((x,y,z))
+                    zmin = min(zmin, v.z); zmax = max(zmax, v.z)
             return max(0.0, zmax - zmin)
 
         def scale_to_height(target_m):
-            cur_h = scene_height()
-            if cur_h <= 0.0:
-                return
-            s = target_m / cur_h
+            cur = bounds_height()
+            if cur <= 0.0: return
+            s = target_m / cur
             for o in bpy.data.objects:
-                if o.type in {"MESH", "ARMATURE", "EMPTY"}:
-                    o.scale *= s
+                if o.type in {"MESH","ARMATURE","EMPTY"}: o.scale *= s
 
-        def make_world_bright():
+        def setup_world_and_light():
+            # bright world so it never renders black
             if bpy.context.scene.world is None:
                 bpy.context.scene.world = bpy.data.worlds.new("World")
-            w = bpy.context.scene.world
-            w.use_nodes = True
-            nt = w.node_tree
-            bg = nt.nodes.get("Background")
+            w = bpy.context.scene.world; w.use_nodes = True
+            bg = w.node_tree.nodes.get("Background")
             if bg:
-                bg.inputs[0].default_value = (1.0, 1.0, 1.0, 1.0)   # white
+                bg.inputs[0].default_value = (1,1,1,1)  # white
                 bg.inputs[1].default_value = 1.0
+            # sun light
+            sun = bpy.data.lights.new("sun","SUN")
+            sun.energy = 3.0
+            so = bpy.data.objects.new("sun",sun)
+            bpy.context.scene.collection.objects.link(so)
+            so.location = (2.0, 2.0, 3.0)
+            so.rotation_euler = (math.radians(50), 0, math.radians(-20))
 
-        def add_camera_front_ortho(scale=2.4):
-            cam = bpy.data.cameras.new("cam")
-            cam.type = 'ORTHO'
-            cam.ortho_scale = scale
-            cam.clip_start = 0.01
-            cam.clip_end = 100.0
-            cam_obj = bpy.data.objects.new("cam", cam)
-            bpy.context.scene.collection.objects.link(cam_obj)
-            cam_obj.location = (0.0, -3.0, 1.2)   # in front, looking toward origin
-            target = bpy.data.objects.new("target", None)
-            bpy.context.scene.collection.objects.link(target)
-            target.location = (0.0, 0.0, 1.0)
-            con = cam_obj.constraints.new(type='TRACK_TO')
-            con.target = target
-            con.track_axis = 'TRACK_NEGATIVE_Z'
-            con.up_axis = 'UP_Y'
-            bpy.context.scene.camera = cam_obj
+        def add_camera_front_ortho(scale=2.6):
+            cam = bpy.data.cameras.new("cam"); cam.type='ORTHO'; cam.ortho_scale = scale
+            co = bpy.data.objects.new("cam", cam)
+            bpy.context.scene.collection.objects.link(co)
+            co.location = (0.0, -4.0, 1.2)  # in front of origin
+            tgt = bpy.data.objects.new("target", None)
+            bpy.context.scene.collection.objects.link(tgt); tgt.location = (0.0, 0.0, 1.0)
+            con = co.constraints.new(type='TRACK_TO'); con.target = tgt
+            con.track_axis='TRACK_NEGATIVE_Z'; con.up_axis='UP_Y'
+            bpy.context.scene.camera = co
 
-        def add_sun():
-            light_data = bpy.data.lights.new(name="sun", type='SUN')
-            light_data.energy = 3.0
-            light_obj = bpy.data.objects.new(name="sun", object_data=light_data)
-            bpy.context.scene.collection.objects.link(light_obj)
-            light_obj.location = (2.0, -2.0, 3.0)
-            light_obj.rotation_euler = (math.radians(55), 0, math.radians(20))
-
-        def setup_eevee(W, H):
+        def setup_cycles(W,H):
             sc = bpy.context.scene
-            sc.render.engine = 'BLENDER_EEVEE'
-            sc.eevee.taa_render_samples = 8
-            sc.render.resolution_x = int(W)
-            sc.render.resolution_y = int(H)
+            sc.render.engine = 'CYCLES'
+            sc.cycles.device = 'CPU'
+            sc.cycles.samples = 8
+            sc.cycles.use_adaptive_sampling = True
+            sc.render.resolution_x = int(W); sc.render.resolution_y = int(H)
             sc.render.film_transparent = False
-            sc.display_settings.display_device = 'sRGB'
-            # white background is already set by make_world_bright
 
-        # args
+        # parse args
         args = sys.argv[sys.argv.index("--")+1:]
         cfg_path, out_png = args[0], args[1]
-        with open(cfg_path, "r") as f:
-            cfg = json.load(f)
-
-        W = cfg.get("W", 800)
-        H = cfg.get("H", 1100)
-        target_h_m = float(cfg.get("height_cm", 180.0)) / 100.0
+        import json
+        with open(cfg_path,"r") as f: cfg = json.load(f)
+        W = cfg.get("W",800); H = cfg.get("H",1100)
+        target_h_m = float(cfg.get("height_cm",180))/100.0
 
         clear_scene()
         add_mannequin()
         scale_to_height(target_h_m)
-        make_world_bright()
+        setup_world_and_light()
         add_camera_front_ortho(scale=2.6)
-        add_sun()
-        setup_eevee(W, H)
+        setup_cycles(W,H)
 
         bpy.context.scene.render.filepath = out_png
         bpy.ops.render.render(write_still=True)
     """)
 
     with tempfile.TemporaryDirectory() as td:
-        cfg = {
-            "W": vp.get("width", 800),
-            "H": vp.get("height", 1100),
-            "height_cm": meas.get("height", 180),
-        }
-        cfg_path = os.path.join(td, "cfg.json")
-        out_png = os.path.join(td, "out.png")
-        with open(cfg_path, "w") as f:
-            json.dump(cfg, f)
-
-        job_path = os.path.join(td, "job.py")
-        with open(job_path, "w") as f:
-            f.write(pycode)
+        cfg = {"W": vp.get("width", 800), "H": vp.get("height", 1100), "height_cm": meas.get("height", 180)}
+        cfg_path = os.path.join(td, "cfg.json"); out_png = os.path.join(td, "out.png")
+        with open(cfg_path,"w") as f: json.dump(cfg,f)
+        job_path = os.path.join(td, "job.py"); open(job_path,"w").write(pycode)
 
         try:
             proc = subprocess.run(
                 [BLENDER_BIN, "-b", "-noaudio", "--python", job_path, "--", cfg_path, out_png],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300, text=True
             )
-            rc = proc.returncode
-            stdout = proc.stdout[-4000:] if proc.stdout else ""
-            stderr = proc.stderr[-4000:] if proc.stderr else ""
+            rc = proc.returncode; stdout = proc.stdout[-4000:] if proc.stdout else ""; stderr = proc.stderr[-4000:] if proc.stderr else ""
         except Exception as e:
             return {"ok": False, "png": "", "rc": -2, "stdout": "", "stderr": f"{type(e).__name__}: {e}"}
 
         if rc != 0 or not os.path.exists(out_png):
             return {"ok": False, "png": "", "rc": rc, "stdout": stdout, "stderr": stderr}
 
-        with open(out_png, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
-        return {"ok": True, "png": "data:image/png;base64," + b64, "rc": rc, "stdout": stdout, "stderr": stderr}
+        b64 = base64.b64encode(open(out_png,"rb").read()).decode("ascii")
+        return {"ok": True, "png": "data:image/png;base64,"+b64, "rc": rc, "stdout": stdout, "stderr": stderr}
 
 @app.get("/")
-def root() -> Dict[str, str]:
-    return {"service": "tlr-avatar", "version": "blender_4"}
+def root(): return {"service": "tlr-avatar", "version": "blender_cycles_1"}
 
 @app.get("/health")
-def health() -> Dict[str, bool]:
-    return {"ok": True}
+def health(): return {"ok": True}
 
 @app.get("/blender/health")
-def blender_health() -> Dict[str, Any]:
-    return {"has_blender": BLENDER_BIN is not None, "blender_path": BLENDER_BIN or ""}
+def blender_health(): return {"has_blender": BLENDER_BIN is not None, "blender_path": BLENDER_BIN or ""}
 
 @app.get("/blender/smoke")
-def blender_smoke() -> JSONResponse:
-    res = run_blender_job({"height": 190, "units": "cm"}, "front", {"width": 800, "height": 1100})
-    return JSONResponse(res)
+def blender_smoke(): return JSONResponse(run_blender_job({"height": 190, "units": "cm"}, "front", {"width": 800, "height": 1100}))
 
 @app.get("/blender/smoke_view")
-def blender_smoke_view() -> HTMLResponse:
+def blender_smoke_view():
     res = run_blender_job({"height": 190, "units": "cm"}, "front", {"width": 800, "height": 1100})
     if res.get("ok") and res.get("png"):
         return HTMLResponse(f"<img style='max-width:100%;background:#fff' src='{res['png']}'/>")
@@ -245,33 +206,13 @@ def blender_smoke_view() -> HTMLResponse:
 @app.post("/avatar/render", response_model=RenderResponse)
 def avatar_render(payload: RenderRequest = Body(..., embed=False)) -> JSONResponse:
     want_png = ("png" in payload.return_) or (payload.engine == "blender")
-    png_out = ""
-    blender_error = ""
-
+    png_out = ""; blender_error = ""
     if want_png and blender_available():
-        res = run_blender_job(
-            meas=payload.measurements.model_dump(),
-            view=payload.view,
-            vp=payload.viewport.model_dump(),
-        )
-        if res.get("ok"):
-            png_out = res.get("png", "")
-        else:
-            blender_error = (res.get("stderr") or res.get("stdout") or "unknown_error")[-800:]
-
-    svg_out = ""
-    engine_name = "blender"
-    if not png_out:
-        engine_name = "svg"
-        svg_out = _fallback_svg(payload.viewport.width, payload.viewport.height)
-
-    meta = {
-        "units": payload.measurements.units,
-        "pose": payload.pose,
-        "engine": engine_name,
-        "status": "ok" if (png_out or svg_out) else "error",
-    }
-    if blender_error:
-        meta["blender_error"] = blender_error
-
+        res = run_blender_job(payload.measurements.model_dump(), payload.view, payload.viewport.model_dump())
+        if res.get("ok"): png_out = res.get("png","")
+        else: blender_error = (res.get("stderr") or res.get("stdout") or "unknown_error")[-800:]
+    svg_out = ""; engine = "blender"
+    if not png_out: engine = "svg"; svg_out = _fallback_svg(payload.viewport.width, payload.viewport.height)
+    meta = {"units": payload.measurements.units, "pose": payload.pose, "engine": engine, "status": "ok" if (png_out or svg_out) else "error"}
+    if blender_error: meta["blender_error"] = blender_error
     return JSONResponse({"svg": svg_out, "png": png_out, "meta": meta})
